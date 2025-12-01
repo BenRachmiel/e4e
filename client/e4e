@@ -105,13 +105,30 @@ def create_portage_tarball(portage_dir=None):
         print(f"Error: {portage_dir} does not exist", file=sys.stderr)
         sys.exit(1)
 
+    # Directories to skip (builder has its own repos)
+    skip_dirs = {"repos.conf", "gnupg"}
+
     # Create tarball in memory
     buf = io.BytesIO()
+    skipped = []
     with tarfile.open(fileobj=buf, mode="w") as tar:
         # Add files with etc/portage prefix
         for item in portage_dir.rglob("*"):
-            arcname = Path("etc/portage") / item.relative_to(portage_dir)
-            tar.add(item, arcname=str(arcname), recursive=False)
+            rel_path = item.relative_to(portage_dir)
+            # Skip certain directories
+            if any(part in skip_dirs for part in rel_path.parts):
+                continue
+            arcname = Path("etc/portage") / rel_path
+            try:
+                tar.add(item, arcname=str(arcname), recursive=False)
+            except PermissionError:
+                skipped.append(str(rel_path))
+
+    if skipped:
+        print(f"Warning: skipped {len(skipped)} files (permission denied)", file=sys.stderr)
+        if len(skipped) <= 5:
+            for s in skipped:
+                print(f"  - {s}", file=sys.stderr)
 
     tarball_bytes = buf.getvalue()
 
