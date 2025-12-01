@@ -83,14 +83,23 @@ def download_file(endpoint, dest_path, config=None):
 
     try:
         with urllib.request.urlopen(url, timeout=300) as resp:
+            expected_size = resp.headers.get("Content-Length")
+            downloaded = 0
             with open(dest_path, "wb") as f:
                 while True:
                     chunk = resp.read(8192)
                     if not chunk:
                         break
                     f.write(chunk)
+                    downloaded += len(chunk)
+
+            if expected_size and int(expected_size) != downloaded:
+                print(f"Warning: expected {expected_size} bytes, got {downloaded}", file=sys.stderr)
     except urllib.error.HTTPError as e:
         print(f"Download error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        print(f"Download connection error: {e.reason}", file=sys.stderr)
         sys.exit(1)
 
 
