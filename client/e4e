@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+"""
+e4e - Emerge for Everywhere
+
+Offload Gentoo package builds to a remote builder.
+Uses only Python standard library - no pip dependencies required.
+"""
+
+import argparse
+import base64
+import hashlib
+import io
+import json
+import os
+import subprocess
+import sys
+import tarfile
+import time
+import urllib.request
+import urllib.error
+from pathlib import Path
+
+
+CONFIG_DIR = Path.home() / ".e4e"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+DEFAULT_PORTAGE_DIR = Path("/etc/portage")
+DEFAULT_BINPKG_DIR = Path("/var/cache/binpkgs")
+
+
+def load_config():
+    """Load config from ~/.e4e/config.json"""
+    if not CONFIG_FILE.exists():
+        return {}
+    with open(CONFIG_FILE) as f:
+        return json.load(f)
+
+
+def save_config(config):
+    """Save config to ~/.e4e/config.json"""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=2)
+
+
+def api_request(endpoint, method="GET", data=None, config=None):
+    """Make an API request to the builder."""
+    if config is None:
+        config = load_config()
+
+    base_url = config.get("endpoint", "http://localhost:8443")
+    url = f"{base_url}{endpoint}"
+
+    headers = {"Content-Type": "application/json"}
+
+    if data is not None:
+        data = json.dumps(data).encode("utf-8")
+
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8")
+        try:
+            error = json.loads(body)
+            print(f"Error: {error.get('detail', body)}", file=sys.stderr)
+        except json.JSONDecodeError:
+            print(f"Error: {body}", file=sys.stderr)
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        print(f"Connection error: {e.reason}", file=sys.stderr)
+        sys.exit(1)
+
+
+def download_file(endpoint, dest_path, config=None):
+    """Download a file from the builder."""
+    if config is None:
+        config = load_config()
+
+    base_url = config.get("endpoint", "http://localhost:8443")
+    url = f"{base_url}{endpoint}"
+
+    try:
+        with urllib.request.urlopen(url, timeout=300) as resp:
+            with open(dest_path, "wb") as f:
+                while True:
+                    chunk = resp.read(8192)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+    except urllib.error.HTTPError as e:
+        print(f"Download error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def create_portage_tarball(portage_dir=None):
+    """Create a tarball of /etc/portage and return (hash, base64_data)."""
+    if portage_dir is None:
+        portage_dir = DEFAULT_PORTAGE_DIR
+
+    portage_dir = Path(portage_dir)
+
+    if not portage_dir.exists():
+        print(f"Error: {portage_dir} does not exist", file=sys.stderr)
+        sys.exit(1)
+
+    # Create tarball in memory
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        # Add files with etc/portage prefix
+        for item in portage_dir.rglob("*"):
+            arcname = Path("etc/portage") / item.relative_to(portage_dir)
+            tar.add(item, arcname=str(arcname), recursive=False)
+
+    tarball_bytes = buf.getvalue()
+
+    # Hash the tarball
+    config_hash = hashlib.sha256(tarball_bytes).hexdigest()[:16]
+
+    # Base64 encode
+    config_b64 = base64.b64encode(tarball_bytes).decode("ascii")
+
+    return config_hash, config_b64
+
+
+def cmd_init(args):
+    """Initialize e4e configuration."""
+    config = load_config()
+
+    if args.endpoint:
+        config["endpoint"] = args.endpoint
+
+    save_config(config)
+
+    # Test connection
+    try:
+        health = api_request("/health", config=config)
+        print(f"Connected to builder at {config.get('endpoint', 'http://localhost:8443')}")
+        print(f"Queue size: {health.get('queue_size', 0)}")
+    except SystemExit:
+        print("Warning: Could not connect to builder", file=sys.stderr)
+
+    print(f"Config saved to {CONFIG_FILE}")
+
+
+def cmd_emerge(args):
+    """Build packages on remote builder."""
+    config = load_config()
+
+    if not config.get("endpoint"):
+        print("Error: No endpoint configured. Run 'e4e init --endpoint URL' first.", file=sys.stderr)
+        sys.exit(1)
+
+    packages = args.packages
+
+    print(f"Building: {', '.join(packages)}")
+
+    # Create portage config tarball
+    print("Packaging portage config...")
+    config_hash, config_b64 = create_portage_tarball(args.portage_dir)
+    print(f"Config hash: {config_hash}")
+
+    # Submit build
+    print("Submitting build...")
+    result = api_request("/build", method="POST", data={
+        "packages": packages,
+        "config_hash": config_hash,
+        "config": config_b64
+    }, config=config)
+
+    build_id = result["build_id"]
+    print(f"Build ID: {build_id}")
+
+    if result.get("need_config"):
+        print("Error: Server requested config but we sent it?", file=sys.stderr)
+        sys.exit(1)
+
+    # Poll for completion
+    print("Waiting for build...")
+    last_log_len = 0
+
+    while True:
+        status = api_request(f"/build/{build_id}", config=config)
+
+        # Show new log lines
+        if args.verbose:
+            log = status.get("log_tail", "")
+            if len(log) > last_log_len:
+                # Print only new content
+                print(log[last_log_len:], end="", flush=True)
+                last_log_len = len(log)
+
+        if status["status"] == "complete":
+            print("\nBuild complete!")
+            break
+        elif status["status"] == "failed":
+            print(f"\nBuild failed: {status.get('error', 'unknown error')}", file=sys.stderr)
+            sys.exit(1)
+        elif status["status"] == "building":
+            if not args.verbose:
+                print(".", end="", flush=True)
+
+        time.sleep(2)
+
+    # Download artifact
+    print(f"Packages built: {status.get('packages_built', [])}")
+
+    if not status.get("packages_built"):
+        print("No packages were built.")
+        return
+
+    binpkg_dir = Path(args.binpkg_dir)
+    binpkg_dir.mkdir(parents=True, exist_ok=True)
+
+    artifact_path = binpkg_dir / f"e4e-{build_id}.tar"
+
+    print(f"Downloading artifact to {artifact_path}...")
+    download_file(f"/build/{build_id}/artifact", artifact_path, config=config)
+
+    # Extract artifact
+    print("Extracting packages...")
+    with tarfile.open(artifact_path) as tar:
+        tar.extractall(binpkg_dir, filter="data")
+
+    # Clean up artifact tarball
+    artifact_path.unlink()
+
+    print(f"Packages extracted to {binpkg_dir}")
+
+    # Run emerge --usepkgonly if requested
+    if args.install:
+        print("Installing packages...")
+        cmd = ["emerge", "--usepkgonly", "--getbinpkg=n"] + packages
+        subprocess.run(cmd)
+
+
+def cmd_status(args):
+    """Check status of a build."""
+    config = load_config()
+
+    status = api_request(f"/build/{args.build_id}", config=config)
+
+    print(f"Build ID: {status['build_id']}")
+    print(f"Status: {status['status']}")
+    print(f"Packages: {', '.join(status['packages'])}")
+    print(f"Built: {', '.join(status.get('packages_built', []))}")
+
+    if status.get("started_at"):
+        print(f"Started: {status['started_at']}")
+    if status.get("completed_at"):
+        print(f"Completed: {status['completed_at']}")
+    if status.get("error"):
+        print(f"Error: {status['error']}")
+
+    if args.logs:
+        logs = api_request(f"/build/{args.build_id}/logs?lines={args.lines}", config=config)
+        print("\n--- Logs ---")
+        print(logs.get("log", ""))
+
+
+def cmd_queue(args):
+    """Show the build queue."""
+    config = load_config()
+
+    queue = api_request("/queue", config=config)
+
+    print(f"Queue size: {queue['queue_size']}")
+    if queue.get("current_job"):
+        print(f"Current job: {queue['current_job']}")
+
+    if queue.get("jobs"):
+        print("\nJobs:")
+        for job in queue["jobs"]:
+            print(f"  {job['build_id'][:8]}  {job['status']:10}  {', '.join(job['packages'])}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="e4e",
+        description="Emerge for Everywhere - remote Gentoo package builder"
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # init
+    p_init = subparsers.add_parser("init", help="Initialize configuration")
+    p_init.add_argument("--endpoint", "-e", help="Builder endpoint URL")
+    p_init.set_defaults(func=cmd_init)
+
+    # emerge
+    p_emerge = subparsers.add_parser("emerge", help="Build packages remotely")
+    p_emerge.add_argument("packages", nargs="+", help="Packages to build")
+    p_emerge.add_argument("--verbose", "-v", action="store_true", help="Show build logs")
+    p_emerge.add_argument("--install", "-i", action="store_true", help="Install after building")
+    p_emerge.add_argument("--portage-dir", default="/etc/portage", help="Portage config directory")
+    p_emerge.add_argument("--binpkg-dir", default="/var/cache/binpkgs", help="Binary package directory")
+    p_emerge.set_defaults(func=cmd_emerge)
+
+    # status
+    p_status = subparsers.add_parser("status", help="Check build status")
+    p_status.add_argument("build_id", help="Build ID")
+    p_status.add_argument("--logs", "-l", action="store_true", help="Show logs")
+    p_status.add_argument("--lines", "-n", type=int, default=50, help="Number of log lines")
+    p_status.set_defaults(func=cmd_status)
+
+    # queue
+    p_queue = subparsers.add_parser("queue", help="Show build queue")
+    p_queue.set_defaults(func=cmd_queue)
+
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
