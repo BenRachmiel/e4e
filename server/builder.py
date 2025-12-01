@@ -109,6 +109,7 @@ class BuildQueue:
             "--with-bdeps=y",
             "--jobs=4",
             "--load-average=8",
+            "--ask=n",  # Override any --ask in EMERGE_DEFAULT_OPTS
         ] + job.packages
 
         result = await self._run_command(job, emerge_cmd)
